@@ -172,8 +172,9 @@ bool ValidSamplePoint(float sample_point)
   return sample_point >= 0.0f && sample_point < 1.0f;
 }
 
-// 空配置表示“不修改”；显式时序必须给全，其余由内核按 bitrate 计算。
-// Empty means "leave unchanged"; explicit timing must be complete.
+// bitrate 和时序全为 0 时保留当前时序；mode 开关始终按配置写入。
+// Zero bitrate/timing preserves current timing; mode switches are always applied.
+// 显式时序必须给全，其余由内核按 bitrate 计算 / Explicit timing must be complete.
 bool ValidNominalTiming(uint32_t bitrate, const CAN::BitTiming& timing)
 {
   if (bitrate == 0U && !HasBitTiming(timing))
@@ -913,6 +914,27 @@ ErrorCode LinuxCANFD::OpenSocket()
   }
   const int index = request.ifr_ifindex;
 
+  const can_err_mask_t errors = CAN_ERR_MASK;
+  if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &errors, sizeof(errors)) < 0)
+  {
+    return fail(SocketError(errno));
+  }
+
+  // 按突发量放大接收缓冲；失败不致命 / Enlarge the RX buffer; failure is not fatal.
+  int receive_buffer = RX_SOCKET_BUFFER;
+  (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
+
+  sockaddr_can address{};
+  address.can_family = AF_CAN;
+  address.can_ifindex = index;
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0)
+  {
+    return fail(SocketError(errno));
+  }
+
+  // 与 SetConfig 的能力刷新串行，避免重连发布过期的 FD 状态。
+  // Serialize with SetConfig's refresh so reconnect cannot publish stale FD state.
+  std::lock_guard<std::mutex> lock(io_mutex_);
   ifreq mtu{};
   std::memcpy(mtu.ifr_name, interface_name_.c_str(), interface_name_.size() + 1);
   if (ioctl(fd, SIOCGIFMTU, &mtu) < 0)
@@ -935,30 +957,7 @@ ErrorCode LinuxCANFD::OpenSocket()
     }
   }
 
-  const can_err_mask_t errors = CAN_ERR_MASK;
-  if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_ERR_FILTER, &errors, sizeof(errors)) < 0)
-  {
-    return fail(SocketError(errno));
-  }
-
-  // 按突发量放大接收缓冲；失败不致命 / Enlarge the RX buffer; failure is not fatal.
-  int receive_buffer = RX_SOCKET_BUFFER;
-  (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
-
-  sockaddr_can address{};
-  address.can_family = AF_CAN;
-  address.can_ifindex = index;
-  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0)
-  {
-    return fail(SocketError(errno));
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    socket_fd_ = fd;
-  }
-  ifindex_ = index;
-  fd_capable_.store(allow_fd, std::memory_order_release);
+  socket_fd_ = fd;
   fd_available_.store(allow_fd, std::memory_order_release);
   return ErrorCode::OK;
 }
@@ -1043,7 +1042,6 @@ ErrorCode LinuxCANFD::Close()
     }
   }
 
-  ifindex_ = -1;
   open_.store(false, std::memory_order_release);
   fd_available_.store(false, std::memory_order_release);
   return result;
@@ -1170,8 +1168,7 @@ ErrorCode LinuxCANFD::RefreshSocketCapabilities()
     return result;
   }
 
-  const bool capable = mtu == CANFD_MTU;
-  const bool use_fd = enable_fd_.load(std::memory_order_acquire) && capable;
+  const bool use_fd = enable_fd_.load(std::memory_order_acquire) && mtu == CANFD_MTU;
 
   std::lock_guard<std::mutex> lock(io_mutex_);
   if (socket_fd_ >= 0 && open_.load(std::memory_order_acquire))
@@ -1186,7 +1183,6 @@ ErrorCode LinuxCANFD::RefreshSocketCapabilities()
   // 即使 socket 正在重连，也先发布目标能力，重连会按同样规则重建。
   // Publish the target capability even while a reconnect is in progress; the reopen
   // derives the same state from the MTU and enable_fd_.
-  fd_capable_.store(capable, std::memory_order_release);
   fd_available_.store(use_fd, std::memory_order_release);
   return ErrorCode::OK;
 }
@@ -1254,7 +1250,7 @@ ErrorCode LinuxCANFD::AddMessage(const FDPack& pack)
   {
     return ErrorCode::STATE_ERR;
   }
-  if (!fd_capable_.load(std::memory_order_acquire))
+  if (!fd_available_.load(std::memory_order_acquire))
   {
     return ErrorCode::NOT_SUPPORT;
   }
@@ -1393,32 +1389,7 @@ void LinuxCANFD::DispatchError(const canfd_frame& frame, uint8_t length)
   const uint8_t copy_length = length < CAN_MAX_DLEN ? length : CAN_MAX_DLEN;
   std::memcpy(pack.data, frame.data, copy_length);
 
-  bool emitted = false;
-  auto emit = [&](bool condition, ErrorID id)
-  {
-    if (!condition)
-    {
-      return;
-    }
-    pack.id = FromErrorID(id);
-    CAN::OnMessage(pack, false);
-    emitted = true;
-  };
-
-  const uint8_t controller = copy_length >= 2 ? frame.data[1] : 0;
-
-  emit((frame.can_id & CAN_ERR_BUSOFF) != 0, ErrorID::CAN_ERROR_ID_BUS_OFF);
-  emit((frame.can_id & CAN_ERR_CRTL) != 0 &&
-           (controller & (CAN_ERR_CRTL_RX_PASSIVE | CAN_ERR_CRTL_TX_PASSIVE)) != 0,
-       ErrorID::CAN_ERROR_ID_ERROR_PASSIVE);
-  emit((frame.can_id & CAN_ERR_CRTL) != 0 &&
-           (controller & (CAN_ERR_CRTL_RX_WARNING | CAN_ERR_CRTL_TX_WARNING)) != 0,
-       ErrorID::CAN_ERROR_ID_ERROR_WARNING);
-  emit((frame.can_id & CAN_ERR_ACK) != 0, ErrorID::CAN_ERROR_ID_ACK);
-  emit((frame.can_id & CAN_ERR_PROT) != 0,
-       LinuxCANDetail::ProtocolErrorID(frame, copy_length));
-  emit((frame.can_id & CAN_ERR_RESTARTED) != 0, ErrorID::CAN_ERROR_ID_OTHER);
-  emit((frame.can_id & CAN_ERR_TRX) != 0, ErrorID::CAN_ERROR_ID_OTHER);
-  emit(!emitted, ErrorID::CAN_ERROR_ID_GENERIC);
+  pack.id = FromErrorID(LinuxCANDetail::FrameErrorID(frame, copy_length));
+  CAN::OnMessage(pack, false);
 }
 }  // namespace LibXR

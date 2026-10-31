@@ -30,10 +30,13 @@ namespace LibXR
  * @note 配置仅支持 bitrate 和 sample_point；显式位时序尚不支持，构造时会触发 REQUIRE。
  *       Configuration supports bitrate and sample_point; explicit timing is unsupported
  *       and triggers REQUIRE when supplied to a constructor.
+ * @note CAN::Configuration 的 bitrate 和时序全为 0 时保留当前时序，mode 各开关始终写入。
+ *       Zero bitrate/timing in CAN::Configuration preserves current timing; all mode
+ *       switches are always applied, including those in a default configuration.
  * @note Open/Close/析构/SetConfig 须由调用方串行执行，不可与其他调用并发。
  *       Serialize Open/Close/destruction/SetConfig externally against other calls.
  *       Close joins the RX thread; do not destroy the object from an RX callback.
- *       SetConfig briefly brings the link down and up again.
+ *       每次有效的 SetConfig 都会短暂 down/up / Each valid SetConfig cycles the link.
  * @note 回调在接收线程执行，不应阻塞；帧引用仅在回调期间有效。
  *       Callbacks run on the RX thread and must not block; frame references are borrowed.
  *       接收线程在允许时使用 SCHED_FIFO，阻塞回调会连带拖延同机的实时线程。
@@ -102,9 +105,10 @@ class LinuxCANFD : public FDCAN
    * @brief 通过 rtnetlink 修改接口配置并重新拉起 / Reconfigure the link via rtnetlink.
    *
    * 只使用内核 C API（NETLINK_ROUTE + IFLA_CAN_*），不依赖 libsocketcan 或 iproute2。
-   * 调用期间接口会短暂 down/up，因此需要 CAP_NET_ADMIN，且不应与 Close 并发。
-   * Uses only kernel C APIs; the link briefly goes down/up, so CAP_NET_ADMIN is needed
-   * and Close must not run concurrently.
+   * 每次有效调用都会将接口短暂 down/up，即使配置与当前相同；需要 CAP_NET_ADMIN，
+   * 且不应与 Close 并发。
+   * Uses only kernel C APIs; every valid call cycles the link down/up, even if the
+   * configuration is unchanged. CAP_NET_ADMIN is needed; Close must not run concurrently.
    *
    * CAN::Configuration 重载只改仲裁相位和工作模式，FD 开关与数据相位保持原状；
    * FDCAN::Configuration 重载同时按 fd_mode 开关 FD、设置数据相位，并据此切换 MTU
@@ -112,6 +116,10 @@ class LinuxCANFD : public FDCAN
    * The CAN overload keeps FD state; the FDCAN overload also applies the data phase and
    * the FD enable flag, switching the MTU accordingly. BRS is a per-frame TX option
    * updated from fd_mode.brs; ESI is controller-driven and ignored.
+   * bitrate 和时序全为 0 时保留当前时序；mode 各开关始终按配置置位或清除，
+   * 因此默认 CAN::Configuration 并非“不修改”。
+   * Zero bitrate/timing preserves current timing; mode switches are always set or
+   * cleared as configured, so a default CAN::Configuration is not a no-op.
    *
    * @note 仅支持按 bitrate 配置；完整显式位时序返回 NOT_SUPPORT，不完整时序返回 ARG_ERR。
    *       Only bitrate-based timing is supported; complete explicit timing returns
@@ -155,7 +163,7 @@ class LinuxCANFD : public FDCAN
   void ReceiveLoop();
   /// 分发一帧 / Dispatch one received frame.
   void Dispatch(const struct canfd_frame& frame, size_t size);
-  /// 把内核错误帧解成 LibXR 错误事件 / Decode a kernel error frame into LibXR events.
+  /// 每个内核错误帧只分发一个错误事件 / Dispatch one LibXR event per kernel error frame.
   void DispatchError(const struct canfd_frame& frame, uint8_t length);
   /// 加锁写入，避免与 Close 关闭 fd 竞争 / Serialize the write against fd close.
   ErrorCode Send(const void* frame, size_t size);
@@ -180,14 +188,12 @@ class LinuxCANFD : public FDCAN
   bool realtime_;                       ///< 接收线程是否用 SCHED_FIFO / Use SCHED_FIFO.
   int socket_fd_ = -1;                  ///< CAN raw socket / CAN raw socket.
   int wake_fd_ = -1;                    ///< 停止唤醒用 eventfd / eventfd waking RX.
-  int ifindex_ = -1;                    ///< 接口索引 / Interface index.
   pthread_t receive_thread_{};          ///< 接收线程句柄 / RX thread handle.
   bool thread_started_ = false;         ///< 接收线程是否已启动 / Whether RX was started.
   std::atomic<bool> open_{false};       ///< 是否已打开 / Whether the driver is open.
   std::atomic<bool> stopping_{false};   ///< 停止或致命错误 / Stop or fatal error.
   std::atomic<bool> fd_available_{false};  ///< 当前 socket 是否允许 FD / Current socket.
-  std::atomic<bool> fd_capable_{false};    ///< 接口是否支持 FD / Whether the link is FD.
-  std::mutex io_mutex_;  ///< 保护 socket_fd_ 的发送与关闭 / Guards fd close vs send.
+  std::mutex io_mutex_;  ///< 保护 socket 配置与生命周期 / Guards config/lifetime.
 };
 
 }  // namespace LibXR

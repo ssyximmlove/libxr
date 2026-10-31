@@ -563,7 +563,7 @@ void TestErrorState(const TestConfig& config)
   Endpoint a(config.a, true, false);
   CAN::ErrorState state{};
   const ErrorCode code = a.can().GetErrorState(state);
-  TEST_ASSERT(code == ErrorCode::OK || code == ErrorCode::NOT_SUPPORT);
+  TEST_ASSERT(code == ErrorCode::OK);
   TEST_ASSERT(state.tx_error_counter <= 255);
 }
 

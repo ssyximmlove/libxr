@@ -189,7 +189,7 @@ set_tests_properties(
 # the static_assert message.
 add_library(
   test_stack_insert_nontrivial OBJECT EXCLUDE_FROM_ALL
-                                      structure/stack/stack_insert_nontrivial.cpp
+  structure/stack/stack_insert_nontrivial.cpp
 )
 target_link_libraries(test_stack_insert_nontrivial PRIVATE xr)
 add_test(NAME stack_insert_nontrivial
@@ -197,9 +197,8 @@ add_test(NAME stack_insert_nontrivial
                  --target test_stack_insert_nontrivial
 )
 set_tests_properties(
-  stack_insert_nontrivial
-  PROPERTIES PASS_REGULAR_EXPRESSION "requires a trivially copyable element type" TIMEOUT
-             120
+  stack_insert_nontrivial PROPERTIES PASS_REGULAR_EXPRESSION
+                                     "requires a trivially copyable element type" TIMEOUT 120
 )
 
 add_library(
